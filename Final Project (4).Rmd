@@ -1,0 +1,432 @@
+---
+title: "How much is a Best Picture Oscar Worth? An Analysis on Inflation Adjusted Domestic Box Office Revenues"
+output: pdf_document
+author: "Ryan Chang, Sanjiv Bhogaraju, Ezra Axel"
+editor_options: 
+  markdown: 
+    wrap: 72
+---
+
+```{r setup, include = FALSE}
+knitr::opts_chunk$set(collapse=TRUE, prompt=TRUE,comment=NULL,message=FALSE, include=TRUE, warning = FALSE)
+library(tidyverse)
+library(ggplot2)
+library(readr)
+library(ggthemes)
+theme_set(theme_stata(base_size = 10))  # for nice looking plots
+library(rvest)
+library(tidytext)
+library(tidyr)
+library(purrr)
+library(polite)
+library(tidytext)
+library(plotly)
+library(stringr)
+library(shiny)
+library(ggfittext)
+library(car)
+library(lmtest)
+library(sandwich)
+```
+
+```{r, include = FALSE}
+# Load in the kaggle datasets of oscar winners and other variables
+library(readr)
+oscars_df <- read_csv("oscars_df.csv") %>% janitor::clean_names() %>% mutate(across(everything(), as.character)) %>% 
+  mutate(award = as.numeric(award == "Winner"))
+
+the_oscar_award <- read_csv("the_oscar_award.csv") 
+
+
+# Filter the data to only include best picture winners. This category was previously called outstanding picture or outstanding production, so filter for those as well. 
+oscars <- the_oscar_award %>%
+  filter(category == "OUTSTANDING PICTURE" | category == "OUTSTANDING PRODUCTION" | category == "BEST PICTURE") %>% 
+  mutate(across(everything(), as.character))
+
+oscars_df <- oscars_df %>% mutate(across(everything(), as.character))
+
+
+# Join these two datasets together
+test1 <- left_join(oscars_df, oscars, by = c("oscar_year" = "year_ceremony", "year_of_release" = "year_film", "film" = "name", "award" = "winner")) %>% 
+  select(2:10)
+
+```
+
+```{r, include = FALSE}
+# Prepare to web scrape the website containing inflation adjusted box office revenues for movies all time
+urls_new <- "https://www.the-numbers.com/box-office-records/domestic/all-movies/cumulative/all-time-inflation-adjusted/"
+index_new <- seq(1, 9000, 100)
+df_new <- list()
+
+
+for (i in 1:length(index_new)){
+  url_adj <- str_glue({urls_new},{index_new[i]})
+  webpage <- read_html(url_adj)
+  table_new <- html_table(webpage)[[1]] %>% 
+    janitor::clean_names() %>% 
+    mutate(across(everything(), as.character))
+  
+  df_new[[i]] <- table_new
+}
+
+df_new_adj <- bind_rows(df_new)
+
+df7 <- left_join(test1, df_new_adj, by = c("film" = "movie", "year_of_release" = "released"))
+
+final_df_adj <- df7 %>% 
+  filter(year_of_release >= 1977) %>%
+  mutate(total_box_office = parse_number(total_box_office)) %>% 
+  mutate(genre = stringr::str_extract(movie_genre, "[^,]+")) %>% 
+  select(-c("rank", "movie_genre", "oscar_year"))
+```
+
+```{r, include = FALSE}
+# some data wrangling to correct column data types, rename cols to make easier later
+# create estimated tickets sold based on the 2021 average ticket price and total revenue for the movie
+# Add variable of within one year of the 2012 Aurora, Colorado movie theater shootings
+  # wikipedia article on the shooting: https://en.wikipedia.org/wiki/2012_Aurora_theater_shooting
+
+final_df_adj <- final_df_adj %>% 
+  mutate(across(4:8, as.numeric)) %>% 
+  mutate(decade = year_of_release - (year_of_release %% 10)) %>%
+  mutate(decade = factor(decade)) %>% 
+  rename(year = year_of_release) %>% 
+  rename(revenue = total_box_office) %>% 
+  rename(runtime = movie_time) %>% 
+  mutate(covid = +(year >= 2020 & film != "Minari")) %>% 
+  mutate(after_911 = +(year >= 2001 & year <= 2005 & film != "Moulin Rouge!" | film == "Little Miss Sunshine"))
+```
+
+```{r, include = FALSE}
+# Because some rows in our dataset contained NA values for the revenues, we checked the website again and manually came up with their box office revenues. There were 34 movies with NA revenues, and the website contained inflation adjusted box office data for 31 of them. We deleted the 3 films that we didn't find data on. These films were: Roma, The Irishman, and Marriage Story. For the other movies, we replaced the NA's with our manually gathered data. Our final dataset that we will use for our regressions and test is called data. 
+
+adj_revs <- c(423428, 1771490282, 269230640, 78161026, 38776975, 60654608, 36506103, 170351457, 254569657, 53553833, 343359148,  124239575, 109281927, 93058501, 24151437, 68098510, 188838553,  8921916, 43132472, 245679563, 33736312, 66594194, 254663281,  62732798, 138407298, 167701560, 3700000, 2248201, 100072, 516819,  116473)
+
+data <- final_df_adj[-c(246, 252, 256),]
+
+for (i in 1:length(data$revenue)){
+  if(is.na(data$revenue[[i]])){
+    data$revenue[[i]] <- adj_revs[[1]]
+    adj_revs <- adj_revs[-1]
+  }
+}
+
+# Separate note about something I found that might not be relevant to our project here but is interesting: 
+# most of the nominees in the two years I looked at were movies released in later months in the year: sept, oct, nov, dec. Does month/time of year have any impact on odds of being nominated for a best picture oscar? 
+```
+
+# Introduction
+
+In this project, we are looking to find an answer to the question: How
+much is a Best Picture Oscar worth? To answer this question, we
+collected data and created a theoretical model using metrics from each
+of the Best Picture Oscar nominees dating back to 1977. We ran an
+econometric analysis on this data, testing for the effect of several
+explanatory variables on our dependent variable, the total box office
+revenue of a movie. Based on the results of these tests, we refined our
+model and came to several conclusions.
+
+# Economic Theory & Our Variables
+
+Our analysis looked for explanatory variables that would have a
+significant effect on the demand for specific movies, as indicated by
+the total box office revenue, including different economic conditions,
+different movie characteristics, movies that appeal to different
+consumer preferences, and promotions for the movie. Based on these
+criteria, our explanatory variables are the year of release, the run
+time, the genre, the IMDb rating, when the movie was released relative
+to the COVID-19 pandemic, whether or not the movie won the Best Picture
+Oscar award, and when the movie was released relative to the September
+11th attacks.
+
+
+$$SRF: Y = \beta_0 + \beta_1 * X_1 + \beta_2 * X_2 + \beta_3 * X_3 + \beta_4 * X_4 + \beta_5 * X_5 + \beta_6 * X_6 + \beta_7 * X_7 +  \\
+\beta_8 * X_8 + \beta_9 * X_9 + \beta_{10} * X_{10} + \beta_{11} * X_{11} + \beta_{12} * X_{12} + \beta_{13} * X_{13} + \beta_{14} * X_{14} + \\ \beta_{15} * X_{15} + \beta_{16} * X_{16} + \beta_{17} * X_{17} + \beta_{18} * X_{18}$$
+
+Y = Total Box Office Revenue 
+X1 - X5 = Decade of Release 
+X6 = Run Time
+X8 - X15 = Genre 
+X7 = IMDb Rating 
+X18 = COVID-19 (Dummy Variable)
+X16 = Award 1 (Dummy Variable) 
+X17 = After 9/11 (Dummy Variable)
+
+**Dependent Variable (Y): Total Box Office Revenue** The dependent
+variable in our model is the total box office revenue of each movie,
+adjusted for inflation. This measure captures the total revenue a movie
+generates over its run in theaters, providing a good indicator of its
+commercial success. Adjusting for inflation is important as it allows us
+to compare movies released in different years consistently.
+
+**Explanatory Variable (X1 - X5): Decade of Release** The decade of
+release is included to account for temporal trends in the industry.
+Various factors, like technological advancements, changing consumer
+preferences, and cyclical economic conditions can influence box-office
+revenues over time. By including this variable, we can control for the
+nature of the industry and any economic trends that might affect movie
+demand across the decades. This categorical variable included 5
+categories, each corresponding to their Beta value. Each decade,
+beginning from the 1980s and going through the 2020s, was its own
+category.
+
+**Explanatory Variable (X6): Run Time** Run time, measured in minutes,
+captures the duration of a movie. The length of a movie could impact its
+box-office performance, as it might affect how many screenings a theater
+can have per day, as well as audience preferences. Some audiences may
+prefer longer movies for perceived value, while others might favor
+shorter films due to the convenience or their attention spans.
+
+**Explanatory Variable (X8 - X15): Genre** Genre is a categorical
+variable used to capture the market's preferences. Different genres have
+varying levels of popularity and target different audience segments,
+which can significantly influence a movie's revenue. Including genre
+helps control for these differences and allows us to see how specific
+genres perform relative to others. The genres are, in order of their
+Beta values: adventure, animation, biography, comedy, crime, drama,
+family, and horror. Each genre is its own category in this categorical
+variable.
+
+**Explanatory Variable (X7): IMDb Rating** The IMDb rating provides a
+measure of the perceived quality of a movie based on user reviews
+(preferences). Higher ratings generally indicate a better audience
+reception and can influence potential viewers' decisions to watch a
+movie. This variable helps capture the effect of early word-of-mouth and
+critical reception on a movie's financial success.
+
+**Explanatory Variable (X18): COVID-19 Pandemic (Dummy Variable)** This
+dummy variable was made to account for the COVID-19 Pandemic. We
+expected that the demand for watching a movie in theaters would decrease
+as consumers grew wary of the risks of watching a movie in theaters with
+the pandemic spreading. We coded this Dummy variable to have a value of
+1 for movies released after March 2020 and 0 for movies from before
+then.
+
+**Explanatory Variable (X16): Best Picture Oscar - Won or Not (Dummy
+Variable)** This dummy variable indicates whether a movie won the Best
+Picture Oscar. Winning this prestigious award can significantly boost a
+movie's visibility and credibility, often leading to increased
+box-office revenues. By including this variable, we can assess the
+impact of winning an Oscar on a movie's financial performance and
+determine if there is a notable difference in revenues for award-winning
+films.
+
+**Explanatory Variable (X17): September 11th Attacks (Dummy Variable)**
+This dummy variable indicates when a movie was released relative to the
+attacks on September 11th, 2001. Because these attacks heavily slowed
+consumerism for the following years, we anticipate that demand for
+movies in theaters would have slowed. This variable is coded with a
+value of 1 for movies released within the 5 years following the attacks,
+and 0 for all other movies.
+
+```{r, include = FALSE}
+# Base model based on Economic Theory
+model1 <- lm(revenue ~ decade + runtime + imdb_rating + genre + award + after_911 + covid, data = data)
+summary(model1)
+```
+
+# Regression Analysis
+
+Our first step in our econometric analysis was to run a regression for our model, including each explanatory variable. We used a histogram to test for the normality of our residuals, which appeared relatively normal with the exception of several values on the right tail. A Q-Q norm test yielded similar results. Because our Shapiro-Wilks test, with a p-value = 2.2 x 10-16 and a W = 0.7861, did not indicate normality, we retested the normality of the residuals without the outliers. Despite our results visually indicating normality, after removing the outliers our Shapiro-Wilks test still did not indicate normality, with a p-value = 4.924 x 10-10 and W = 0.92554. 
+
+
+
+```{r, echo = FALSE}
+# Checking for normality in the residuals to maintain unbiased estimators
+
+# Histogram
+ggplot(data, aes(x = model1$residuals)) + 
+  geom_histogram() + 
+  labs(title = "Histogram to check for residual normality", x = "Residuals")
+
+# QQ Plot
+ggplot(data, aes(sample = model1$residuals)) + 
+  geom_qq() + 
+  geom_qq_line() + 
+  labs(title = "QQ Plot", x = "Theoretical Normal Quantiles", y = "Sample Quantiles")
+
+
+# Shapiro-Wilk test for normality
+shapiro.test(model1$residuals)
+
+
+# We concluded based on these initial tests that the normality of residuals assumption of the CLRM was violated. There seemed to be a few outliers (we roughly counted 6), so we are going to subset the data without these outliers and run the same regression and look at the same normality tests to determine if the new data is normal in the residuals. 
+```
+
+```{r, echo = FALSE}
+# getting the observations with the highest 6 residuals, removing them from our dataset
+tail(sort(model1$residuals), 6)
+test_data <- data[-c(28, 242, 85, 161, 100, 4), ]
+
+
+# running the second regression on the data without outliers
+model2 <- lm(revenue ~ decade + runtime + imdb_rating + genre + award + after_911 + covid, data = test_data)
+ggplot(test_data, aes(x = revenue, y = model2$residuals)) + 
+  geom_point()
+
+
+# normality tests
+shapiro.test(model2$residuals)
+
+ggplot(test_data, aes(model2$residuals)) + 
+  geom_histogram() +
+  labs(title = "Histogram to check for residual normality", x = "Residuals")
+
+
+ggplot(test_data, aes(x = revenue, y = model2$residuals)) + 
+  geom_point()
+
+# While the graphs visually looked better, our Shapiro Wilk test still did not indicate normality in the residuals. We will proceed with all of our analysis using the full dataset that includes outliers, but with the background knowledge that our estimations and results are likely biased and inefficient. 
+```
+
+# Ramsey RESET Test
+
+Next, we ran a Ramsey RESET Test to test that the relationship between revenue and IMDb rating and run time (our two quantitative variables) was linear. We used degrees of freedom of 2 and 241 to find our acceptance region of (0, 3.041). Our calculated F-statistic was 0.482, falling within our acceptance region, so we failed to reject the null hypothesis that the relationship between revenue and IMDb rating run time is linear. 
+
+
+```{r, include = FALSE}
+# We performed a Ramsey RESET test on this model that squares both runtime and imdb_rating to test the hypothesis that the relationship between revenue and imdb rating and runtime is linear. 
+model3 <- lm(revenue ~ decade + runtime + I(runtime^2) + imdb_rating + I(imdb_rating^2) + genre + award + after_911 + covid, data = data)
+
+# Results: 
+# F-stat: 0.482, df = (2, 241). Critical F-stat = 3.041. 
+# F-stat within AR, fail to reject the null that relationship between revenue and imdb rating and runtime is linear. 
+```
+
+
+# F-Tests
+Because our COVID-19 variable and our September 11th Attacks variable did not appear to be statistically significant using the quick and dirty rule from our summary, we decided to run an F-test on each of these variables to determine whether they should be included in our final model. 
+
+To test for the significance of the September 11th attacks, we used 1 and 244 degrees of freedom at a 5% level of significance, with a critical region of (0,3.888). Using an unrestricted R-squared value of 0.4226 and a restricted R-squared of 0.4225, we calculated an F-statistic of 0.0422584. Because this F-statistic lies in our acceptance region, we fail to reject the null hypothesis that $\theta = 0$ and that there is no difference between the $R^2$ values of the two models, so we will not include this variable in our model. 
+
+To test for the significance of COVID-19, the R-squared value for both our restricted and unrestricted model was 0.4226, meaning that the F-statistic will be 0. With an F-statistic of 0, we will never reject the null hypothesis, and therefore we fail to reject the null hypothesis that $\theta = 0$ and that there is no difference between the $R^2$ values of the two models, so we will not include this variable in our model. 
+
+
+
+```{r, include = FALSE}
+# First performing an F-test on the restriction that the beta corresponding to after_911 is equal to 0
+model4 <- lm(revenue ~ decade + runtime + imdb_rating + genre + award + covid, data)
+summary(model4)
+
+# Degrees of freedom: (1, 244)
+# unrestricted R squared: .4226, restricted R squared: .4225
+# F-statistic: 0.0422584
+# critical F-value: 3.888
+# conclusion: fail to reject hypothesis that beta = 0, do not include variable
+```
+
+```{r, include = FALSE}
+# performing f test on the restriction that beta corresponding to covid or not is equal to 0
+model5 <- lm(revenue ~ decade + runtime + imdb_rating + genre + award + after_911, data)
+summary(model5)
+
+# R squared for this model is the exact same as the unrestricted model, so there is no reason to even proceed with the test. Our calculated F stat would be 0, which will always be in the acceptance region. Conclusion: do not include covid variable
+```
+
+
+```{r, include = FALSE}
+new_model <- lm(revenue ~ decade + runtime + imdb_rating + genre + award, data)
+```
+
+# Heteroscedasticity 
+
+We then tested for heteroscedasticity using a Breusch-Pagan-Godfrey
+test. We chose this test over a Park test because it was a more general
+test that can be applied to multiple regression models like ours.
+Because our Breusch-Pagan-Godfrey test concluded that heteroscedasticity
+was present in our model (df = 16, p = 0.003846). We proceeded to
+calculate the White-robust standard errors estimates for our explanatory
+variables. While this doesn't address problems with the inefficiency of
+those variables, it does allow us to use accurate predicted standard
+errors so we can proceed with statistical inference. In this case, R, in
+assuming no heteroscedasticity in our data, underestimated many of our
+predicted standard errors. For example, R's estimate for the standard
+error on the decade1980 variable was 51,064,140, whereas the
+White-corrected standard error estimate was 84,476,057. However, R
+didn't underestimate all of the estimates, as in our genreHorror variable, R 
+estimated a standard error of 179,404,172 whereas the White-corrected standard
+error was 78,715,217.
+
+
+```{r, include = FALSE}
+# Breusch Pagan Godfrey Test for heteroscedasticity
+bptest(new_model)
+
+# Results: BP stat = 35.104, df = 16, p-value = 0.003846
+```
+
+```{r, include = FALSE}
+# Calculating White-robust standard errors
+coeftest(new_model, vcov = vcovHC(new_model, type = "HC0"))
+```
+
+
+
+
+# Hypothesis Tests
+
+We ran a T-test on our Award 1 variable to test for whether winning the Best Picture is significant at a 5% level of significance with 243 degrees of freedom. The hypotheses for this test are:
+$$H_0: \beta_{16} = 0$$
+$$H_1: \beta_{16} \neq 0$$
+
+
+Our estimate for $\beta_16$ lies outside of the acceptance region for this test, therefore we reject the null hypothesis that $\beta_16 = 0$ and that there is no significant effect on box office revenues after winning best picture. Winning the Best Picture Oscar does have a significant effect on box office revenue. 
+
+
+```{r, include = FALSE}
+# Null hypothesis: beta16 = 0
+# Alternative Hypothesis: beta16 != 0
+# Using beta16 = 78551917 and SE = 33543659
+# Using df = 243 and 5% significance
+# Critical T: 1.984
+# Acceptance Region: 0 +- 1.984 * 33543659 = (-66550619.46, 66550619.46)
+# Conclusion: Estimate for beta16 lies outside of the acceptance region for this test. Reject null that beta16 = 0. Winning best picture does have a significant impact on inf. adjusted domestic box office revenue of a movie. 
+```
+
+
+
+# Autocorrelation
+We then performed a Durbin-Watson test, which tests for autocorrelation on our model. Smaller values (close to 0) of the D-statistic signify positive autocorrelation, while larger values (closer to 4) signify negative autocorrelation. After performing our test, we found a D-statistic of 2.1246. Our p-value was 0.71633. We conclude that with a D-statistic close to 2 and a large p-value, we fail to reject the null hypothesis that $\rho = 0$. Therefore we conclude that there is no autocorrelation in our model.
+
+
+
+```{r, include = FALSE}
+# Testing for Autocorrelation
+dwtest(model1)
+# D-stat: 2.1246, p-value 0.7633
+```
+
+Hypotheses for the Durbin-Watson: $$H0: \rho = 0$$ $$H1: \rho > 0$$
+
+# Multicollinearity
+
+To test for multicollinearity, we looked at the VIF values for each of
+our explanatory variables. If we set our baseline value at 10, as
+specified in Gujarati and Porter, the only variable that might point to
+multicollinearity is decade, with a vif value of 14.7. This makes sense;
+if a movie came out in a specific decade, other decades' values could
+not be 1 as well. Thinking about the economic context of our study and
+data, we conclude that dealing with this issue isn't super necessary. We
+still want to look at the significance of different decades and how they
+impact inflation adjusted domestic box office revenues. We also don't
+want to omit the variable and possibly run into omitted variables bias.
+
+```{r, include = FALSE}
+# Testing for multicollinearity
+vif(model1)
+```
+
+
+# Conclusion
+
+Our analysis sought to determine the impact of winning the Best Picture Oscar on a movie's total box office revenue, using a dataset composed of Best Picture Oscar nominees since 1977. We constructed a theoretical model using various explanatory variables and performed multiple regression analyses, along with several tests to ensure the robustness of our findings.
+
+Our regression model identified several significant factors influencing box office revenue, including decade of release, run time, genre, IMDb rating, and whether the movie won the Best Picture Oscar. Despite the non-normal distribution of residuals as indicated by the Shapiro-Wilks test, when outliers were removed our normality plots looked more normal. However, the Shapiro-Wilks test still concluded non-normality. The Ramsey RESET test confirmed the linearity of the relationship between revenue and our quantitative variables, IMDb rating, and run time.
+
+Our hypothesis test concluded that winning the Best Picture Oscar significantly increases box office revenue, as evidenced by the rejection of the null hypothesis for this variable. Following our F-tests, we failed to reject the null hypothesis that the variables for the COVID-19 pandemic and the September 11th attacks did not significantly impact box office revenue, suggesting that there was no significant difference between our restricted and unrestricted models.
+
+We also found no evidence of autocorrelation in our model, further supporting the reliability of our regression results. However, we did find heteroscedasticity, so we used White corrected standard errors to perform further statistical inference. Despite the challenges with the genre variable, we ensured that our model accurately reflected the influence of movie genres on box office performance.
+
+Our econometric analysis confirms that winning the Best Picture Oscar has a positive and significant effect on a movie's box office revenue, highlighting the economic value of this prestigious award. 
+
+
